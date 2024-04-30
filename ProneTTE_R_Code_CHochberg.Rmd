@@ -1,0 +1,292 @@
+---
+title: "ProneTTE_Analysis"
+author: "Chad Hochberg"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(survival) #For Survival Analysis and Competing Risk
+library(ggsurvfit) #For Creating KM Curves
+library(mice) #For Multiple Imputation Using Chained Equations
+library(MatchThem) #Provides wrapper for using MatchIt/WeightIt with MICE
+library(rms) #Provides tools for making restricted spline terms
+library(CBPS) #Covariate Balancing Propensity Score
+library(patchwork) #For Combining Figures
+```
+
+```{r Evaluate Matrix of Missingness and Use Multiple Imputation to Deal With Missingness}
+#Here we will create the datasets with the imputed data to address missingness 
+#First Filter to final data (which is the analytic_short dataset, here with the final needed variables seslected)
+df <- analytic_short |>  
+  mutate(year=factor(year)) |>
+  select(vent_duration, dc_home, died, dc_hospice, tracheostomy, avg_prone_duration, first_prone_duration, prone_gt24h, age, gender, race, nonwhite, bmi, charlson, nr_sofa_score, pf_qualifying, pf12_16_low, tvpbw_weighted, admit_to_mv, hospital_proned, icu_proned, study_month, norepi_equivalent, nmb_use, crrt_before_16, decision_hour, dp_weighted, died90, diedtime90, died28, diedtime28, died60, diedtime60, icu_los_index, icu_los_total, academic_hospital, time_to_prone, bmi_cat, year, tv_pbw, pplat, peep_weighted, vent_mode16, fio2_qualifying, cmprsk_event28, risk_time28, cmprsk_event90, risk_time90, icu_free90, icu_free28, alive_nomv90, alive_nomv28, alive_noicu90, alive_noicu90, time_icu_90, icu_los90_cmprsk, vfd_90_prone16, vent_duration90, delta_pf)
+
+md.pattern(df, rotate.names = TRUE)
+#Non-monotonic Missingness Pattern - Primary analysis will use MICE with a MAR assumption
+#Sensitivity analysis will include a complete case analysis
+
+# Perform imputation
+set.seed(322)
+df.imp <- mice(df, m = 1, printFlag = FALSE, set.seed(322)) #Run 1 time to obtain and adjust matrix
+p <- df.imp$predictorMatrix
+#Extract Predictor Matrix So Can Specify the Variables That will be Used for Imputation
+imputers <- c('age', 'gender', 'race', 'bmi', 'charlson', 'nr_sofa_score', 
+              'pf_qualifying', 'dp_weighted', 'tvpbw_weighted', 'norepi_equivalent', 
+              'nmb_use', 'admit_to_mv', 'hospital_proned', 'died90', 'study_month', 
+              'peep_weighted', 'prone_gt24h', 'peep_weighted', 'tvpbw_weighted', 
+              'dp_weighted', 'pf12_16_low', 'icu_los90_cmprsk')
+p[,] = 0
+p[ , imputers] = 1
+p['peep_weighted','peep_weighted']= 0 #Not Used to Impute Themselves
+p['tvpbw_weighted','tvpbw_weighted']= 0 #Not Used to Impute Themselves
+p['dp_weighted', 'dp_weighted'] = 0 #Not Used to Impute Themselves
+p['pf12_16_low', 'pf12_16_low'] = 0 #Not Used to Impute Themselves
+
+#Now run full Imputation
+df.imp <- mice(df, m = 15, predictorMatrix = p, set.seed(322))
+```
+
+
+```{r Create Propensity Score Weights Using Covariate Balancing Propensity Score}
+#Now Use Weight it package to create inverse probability of treatment weighting scores
+#1st Evaluate Baseline Balance 
+bal.tab(prone_gt24h ~ age + gender + factor(nonwhite) + factor(bmi_cat) + charlson + nr_sofa_score + pf12_16_low + dp_weighted + tvpbw_weighted + admit_to_mv + factor(norepi_equivalent) + nmb_use + academic_hospital + decision_hour + study_month + factor(year) + bmi + pf_qualifying + peep_weighted + delta_pf, data = df.imp, estimand = 'ATE', thresholds = c (m=0.10))
+
+#Here is the Model form for the propensity score; incorporates restricted cubic spline for study_month
+ps.form <- prone_gt24h ~ age + factor(gender) + nonwhite + factor(bmi_cat) + 
+  charlson + nr_sofa_score + pf_qualifying + delta_pf + dp_weighted + tvpbw_weighted + 
+  peep_weighted + admit_to_mv + factor(norepi_equivalent) + 
+  nmb_use + factor(hospital_proned) + factor(decision_hour) + rcs(study_month,4)
+
+set.seed(32284)
+#Create Stabilized Weights, Using Over-Identified Method as is the default in the CBPS package
+#Estimand is the ATE or "Average Treatment Effect"
+cbps_weights <- weightthem(ps.form, datasets = df.imp, approach = "within",  method = "cbps", estimand = "ATE", stabilize = TRUE, over = TRUE)
+
+#Summarize and Plot the Weights
+summary(cbps_weights)
+print(plot(summary(cbps_weights)))
+
+#Show Balance Statistics
+print(b <- bal.tab(cbps_weights, addl = c('vent_mode16', 'year', 'bmi', 'peep_weighted', 'academic_hospital')))
+#Extract Variable Names and Rename
+v1 <- var.names(b, type = 'vec', minimal = TRUE)
+v1["age"] <- "Age"
+v1["nonwhite"] <- "Non-white Race"
+v1["factor(bmi_cat)"] <- "BMI Category"
+v1["charlson"] <- "Charlson Index"
+v1["nr_sofa_score"] <- "non-Respiratory SOFA Score"
+v1["pf_qualifying"] <- "PaO2/FIO2"
+v1["dp_weighted"] <- "Driving Pressure"
+v1["tvpbw_weighted"] <- "Tidal Volume/PBW"
+v1["admit_to_mv"] <- "Admission to MV (hours)"
+v1["factor(norepi_equivalent)"] <- "Norepi Equivalent"
+v1["factor(hospital_proned)"] <- "Hospital"
+v1["nmb_use"] <- "NMB Infusion"
+v1["factor(decision_hour)"] <- "Hour of 'Randomization'"
+v1["study_month"] <- "Study Month"
+v1["study_month'"] <- "Study Month-Spline1"
+v1["study_month''"] <- "Study Month-Spline2"
+v1["factor(gender)"] <- "Gender"
+v1["delta_pf"] <- "Change in PF"
+v1["peep_weighted"] <- "Time-weighted PEEP"
+
+#Create Love Plot; THis is for Paper so Will fix Names
+print(love <- love.plot(cbps_weights, title = "Balance After CBPS Propensity Score Weighting", abs = TRUE, drop.missing = TRUE, thresholds = c(m= 0.10), sample.names = c("Unweighted", "Weighted"), position = c(0.75, 0.25), var.order = "unadjusted", drop.distance = TRUE, 
+  line = FALSE, grid = TRUE, var.names = v1) +
+  theme(legend.box.background = element_rect())
+)
+pdf("graphs/loveplot_cbps.pdf")
+love
+dev.off()
+```
+
+```{r Primary Analysis: IPTW Doubly Robust Models}
+#PRIMARY OUTCOME: Time to Dathby Day 90
+#Doubly Robust IPTW
+#Below is Model Form for Multivariable Regression
+multivar_surv <- with(cbps_weights, coxph(Surv(diedtime90, died90) ~
+                          prone_gt24h + age + factor(gender) + nonwhite + factor(bmi_cat) + 
+                          charlson + nr_sofa_score + pf_qualifying + delta_pf + dp_weighted + 
+                          tvpbw_weighted + peep_weighted +admit_to_mv + (norepi_equivalent) + 
+                          nmb_use + factor(hospital_proned) + rcs(study_month,4), 
+                          robust = TRUE))
+results <- pool(multivar_surv)
+print('Survival at 90 Days - Multivariable IPTW')
+summary(results, exponentiate = TRUE, conf.int=TRUE)
+
+#SECONDARY OUTCOMES: Time to Ventilator Liberation and Alive by Day 90, OUt of ICU and Alive by Day 90 90
+#Here use the 'finegray' command from survival package to created a weighted dataset that is then run with standard cox regression
+#Needed to run each model separately and then pool
+#IPT Weighted Mulivariable Competing Risk Regression for Alive and Off Ventilator by Day 90
+#NOTE: Fine and Gray Models Use Robust Standard Error Estimation in this Package by Default
+models <- lapply(1:df.imp$m, function(i) {
+  tempdf <- complete(cbps_weights, i, include = FALSE)
+  fg_df <- finegray(Surv(risk_time90, cmprsk_event90) ~ ., 
+                    data = tempdf,  # Corrected to use tempdf
+                    etype = 'Off Vent', 
+                    weights = tempdf$weights)  #CBPS Weights From Each Imputed Dataset
+  
+  mfit[i] <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                  prone_gt24h + age + factor(gender) + nonwhite + factor(bmi_cat) + 
+                          charlson + nr_sofa_score + pf_qualifying + delta_pf + dp_weighted + 
+                    tvpbw_weighted + peep_weighted + admit_to_mv + factor(norepi_equivalent) + 
+                    nmb_use + factor(hospital_proned) + rcs(study_month,4),
+                   data = fg_df,  # Corrected to use fg_df
+                   weight = fg_df$fgwt)
+})
+crr_mod <- as.mira(models)
+print('Off Vent by Day 90 - Multivariable IPTW Competing Risk')
+summary(pool(crr_mod), exponentiate = TRUE, conf.int = TRUE)
+
+#Time to ICU Discharge
+models <- lapply(1:df.imp$m, function(i) {
+  tempdf <- complete(cbps_weights, i, include = FALSE)
+  fg_df <- finegray(Surv(time_icu_90, icu_los90_cmprsk) ~ ., 
+                    data = tempdf,  # Corrected to use tempdf
+                    etype = 'ICU DC', 
+                    weights = tempdf$weights)  # Corrected to use tempdf$weights
+  
+  mfit[i] <- coxph(Surv(fgstart, fgstop, fgstatus) ~ 
+                  prone_gt24h + age + factor(gender) + nonwhite + factor(bmi_cat) + 
+                          charlson + nr_sofa_score + pf_qualifying + delta_pf + dp_weighted + tvpbw_weighted + 
+                          peep_weighted +admit_to_mv + factor(norepi_equivalent) + nmb_use + factor(hospital_proned) +
+                          rcs(study_month,4),
+                   data = fg_df,  # Corrected to use fg_df
+                   weight = fg_df$fgwt)
+})
+crr_mod <- as.mira(models)
+print('Out of ICU by Day 90 - Multivariable IPTW Competing Risk')
+summary(pool(crr_mod), exponentiate = TRUE, conf.int = TRUE)
+
+```
+
+```{r Kaplan-Meier and Cumulative Incidence Curves for Primary Analysis}
+##NOW Weighted Curves - Will Use the Mean CBPS Weights
+df <- mice::complete(cbps_weights, action = 'long' ) |>
+  group_by(.id) |>
+  mutate(weights=mean(weights)) |>
+  ungroup() |>
+  filter(.imp==1) |>
+  mutate(prone_gt24h = as.numeric(prone_gt24h)) |>
+  mutate(prone_gt24h=factor(prone_gt24h, 
+                  levels = c(2, 1),             
+                  labels = c("Extended Proning", "Standard Proning"), 
+                                ordered = TRUE))
+print(km90iptw <- survfit2(Surv(diedtime90, died90) ~ prone_gt24h, data = df, weights = df$weights) %>%
+  ggsurvfit(linetype_aes = TRUE,
+            linewidth = 0.60) +
+  labs(
+    x = "Days",
+    y = "Survival"
+  ) + 
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent, 
+    expand = c(0.01, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 90, by = 15), expand = c(0.02, 0)) +
+  scale_color_manual(values = cols,
+                     limits = c("Extended Proning", "Standard Proning"),
+                     labels = c("Extended Proning", "Standard Proning")) +
+  scale_linetype_manual(values = c("Extended Proning" = 1, "Standard Proning" = 1)) +
+  theme_classic())
+ggsave("KM_D90_IPTW.pdf",
+       device = "pdf",
+       path='graphs/')
+
+#Alive and Off Vent Cumulative Incidence Weighted Curveg
+#Use Fine and Gray Estimates
+fg_plotdf <-finegray(Surv(risk_time90, cmprsk_event90) ~ ., 
+                                  data = df,  # Corrected to use tempdf
+                                  etype = 'Off Vent', 
+                                  weights = df$weights)
+
+fg_survfit2 <-survfit(Surv(fgstart, fgstop, fgstatus) ~ 
+                    prone_gt24h,
+                    data = fg_plotdf,  # Corrected to use fg_df
+                    weight = fgwt)
+print(offvent90iptw <- ggsurvfit(
+  fg_survfit2,
+  linetype_aes = TRUE, 
+  type = 'risk') +
+    labs(
+    x = "Days",
+    y = "Off of Ventilator"
+  ) + 
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent, 
+    expand = c(0.01, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 90, by = 15), expand = c(0.02, 0)) +
+  scale_color_manual(values = c("#6666FF", "#FF9900"),
+                    limits = c("prone_gt24h=Extended Proning", "prone_gt24h=Standard Proning"),
+                    labels = c("Extended Proning", "Standard Proning")) +
+  scale_linetype_manual(values = c(8,8),
+                        limits = c("prone_gt24h=Extended Proning", "prone_gt24h=Standard Proning"),
+                        labels = c("Extended Proning", "Standard Proning")) +
+  theme_classic())
+ggsave("OffVent_D90_IPTW.pdf",
+       device = "pdf",
+       path='graphs/')
+
+#ICU Discharge WEighted
+fg_plotdf <-finegray(Surv(time_icu_90, icu_los90_cmprsk) ~ ., 
+                                  data = df,  
+                                  etype = 'ICU DC', 
+                                  weights = df$weights)
+
+fg_survfit2 <-survfit(Surv(fgstart, fgstop, fgstatus) ~ 
+                    prone_gt24h,
+                    data = fg_plotdf,  # Corrected to use fg_df
+                    weight = fgwt)
+print(iculos90iptw <- ggsurvfit(
+  fg_survfit2,
+  linetype_aes = TRUE, 
+  type = 'risk') +
+    labs(
+    x = "Days",
+    y = "ICU Discharge"
+  ) + 
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent, 
+    expand = c(0.01, 0)
+  ) +
+  scale_x_continuous(breaks = seq(0, 90, by = 15), expand = c(0.02, 0)) +
+  scale_color_manual(values = c("#6666FF", "#FF9900"),
+                    limits = c("prone_gt24h=Extended Proning", "prone_gt24h=Standard Proning"),
+                    labels = c("Extended Proning", "Standard Proning")) +
+  scale_linetype_manual(values = c(6,6),
+                        limits = c("prone_gt24h=Extended Proning", 
+                                   "prone_gt24h=Standard Proning"),
+                        labels = c("Extended Proning", "Standard Proning")) +
+  theme_classic())
+ggsave("ICULOS_D90_IPTW.pdf",
+       device = "pdf",
+       path='graphs/')
+
+#Put Graphs Together into One Figure
+print(plot1 <- km90 + km90iptw + 
+         offvent90 + offvent90iptw + 
+         iculos90 + iculos90iptw + plot_layout(guides = 'collect', nrow = 3))
+ggsave("Patchwork_SurvivalCurves.pdf",
+       device = "pdf",
+       width = 8.5,
+       height = 11,
+       units = 'in',
+       dpi=1000,
+       path='graphs/')
+ggsave("Patchwork_SurvivalCurves.jpeg",
+       device = "jpeg",
+       width = 8.5,
+       height = 11,
+       units = 'in',
+       dpi=1000,
+       path='graphs/')
+```
